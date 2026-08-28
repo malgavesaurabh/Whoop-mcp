@@ -191,7 +191,7 @@ app.get("/", (_req, res) => {
   res.type("text").send(
     `Whoop MCP server\n` +
       `Authorized: ${refreshToken ? "yes" : "no — visit /auth"}\n` +
-      `MCP endpoint: ${REDIRECT_URI.replace("/callback", "")}/mcp/<MCP_SECRET>\n`
+      `MCP endpoint (OAuth): ${REDIRECT_URI.replace("/callback", "")}/mcp\n`
   );
 });
 
@@ -227,14 +227,129 @@ app.get("/callback", async (req, res) => {
 
 app.get("/health", (_req, res) => res.json({ ok: true, authorized: !!refreshToken }));
 
-app.all("/mcp/:secret", async (req, res) => {
-  if (req.params.secret !== MCP_SECRET) return res.status(401).send("unauthorized");
+
+// ---------- Minimal OAuth 2.1 authorization server (single user, PKCE, stateless HMAC tokens) ----------
+const ORIGIN = BASE_URL.replace(/\/$/, "");
+const b64u = (buf) => Buffer.from(buf).toString("base64url");
+const sign = (payload) => {
+  const body = b64u(JSON.stringify(payload));
+  const mac = crypto.createHmac("sha256", MCP_SECRET).update(body).digest("base64url");
+  return `${body}.${mac}`;
+};
+const verify = (tok) => {
+  if (!tok || !tok.includes(".")) return null;
+  const [body, mac] = tok.split(".");
+  const exp = crypto.createHmac("sha256", MCP_SECRET).update(body).digest("base64url");
+  if (mac.length !== exp.length || !crypto.timingSafeEqual(Buffer.from(mac), Buffer.from(exp))) return null;
+  try { const p = JSON.parse(Buffer.from(body, "base64url")); return p.exp > Date.now() / 1000 ? p : null; } catch { return null; }
+};
+const authCodes = new Map(); // code -> {client_id, redirect_uri, code_challenge, exp}
+
+app.get(["/.well-known/oauth-authorization-server", "/.well-known/oauth-authorization-server/mcp"], (_req, res) =>
+  res.json({
+    issuer: ORIGIN,
+    authorization_endpoint: `${ORIGIN}/authorize`,
+    token_endpoint: `${ORIGIN}/token`,
+    registration_endpoint: `${ORIGIN}/register`,
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code", "refresh_token"],
+    code_challenge_methods_supported: ["S256"],
+    token_endpoint_auth_methods_supported: ["none", "client_secret_post"],
+    scopes_supported: ["whoop"],
+  })
+);
+app.get(["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"], (_req, res) =>
+  res.json({ resource: `${ORIGIN}/mcp`, authorization_servers: [ORIGIN], scopes_supported: ["whoop"], bearer_methods_supported: ["header"] })
+);
+
+app.post("/register", (req, res) => {
+  const { redirect_uris = [], client_name = "client" } = req.body || {};
+  const client_id = crypto.randomBytes(12).toString("hex");
+  res.status(201).json({
+    client_id, client_name, redirect_uris,
+    token_endpoint_auth_method: "none",
+    grant_types: ["authorization_code", "refresh_token"],
+    response_types: ["code"],
+  });
+});
+
+app.get("/authorize", (req, res) => {
+  const { client_id, redirect_uri, state = "", code_challenge, code_challenge_method, response_type } = req.query;
+  if (response_type !== "code" || !redirect_uri || !code_challenge || code_challenge_method !== "S256")
+    return res.status(400).send("invalid_request");
+  const q = new URLSearchParams({ client_id, redirect_uri, state, code_challenge }).toString();
+  res.type("html").send(`<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="font-family:-apple-system,sans-serif;max-width:420px;margin:60px auto;padding:0 20px">
+<h2>Connect Whoop to Claude</h2><p>Enter your server passphrase to allow access to your Whoop data.</p>
+<form method="POST" action="/authorize?${q}"><input name="passphrase" type="password" placeholder="Passphrase" required
+style="width:100%;padding:12px;font-size:16px;margin:8px 0 16px;box-sizing:border-box">
+<button style="width:100%;padding:12px;font-size:16px;background:#111;color:#fff;border:0;border-radius:8px">Allow</button></form></body>`);
+});
+
+app.post("/authorize", express.urlencoded({ extended: false }), (req, res) => {
+  const { client_id, redirect_uri, state = "", code_challenge } = req.query;
+  const pass = req.body?.passphrase || "";
+  if (pass.length !== MCP_SECRET.length || !crypto.timingSafeEqual(Buffer.from(pass), Buffer.from(MCP_SECRET)))
+    return res.status(401).send("Wrong passphrase. Go back and try again.");
+  const code = crypto.randomBytes(24).toString("hex");
+  authCodes.set(code, { client_id, redirect_uri, code_challenge, exp: Date.now() + 5 * 60 * 1000 });
+  const u = new URL(redirect_uri);
+  u.searchParams.set("code", code);
+  if (state) u.searchParams.set("state", state);
+  res.redirect(u.toString());
+});
+
+app.post("/token", express.urlencoded({ extended: false }), (req, res) => {
+  const b = { ...req.body };
+  const issue = () => {
+    const now = Math.floor(Date.now() / 1000);
+    res.json({
+      access_token: sign({ sub: "user", exp: now + 30 * 86400, t: "access" }),
+      refresh_token: sign({ sub: "user", exp: now + 365 * 86400, t: "refresh" }),
+      token_type: "Bearer", expires_in: 30 * 86400, scope: "whoop",
+    });
+  };
+  if (b.grant_type === "authorization_code") {
+    const rec = authCodes.get(b.code);
+    authCodes.delete(b.code);
+    if (!rec || rec.exp < Date.now()) return res.status(400).json({ error: "invalid_grant" });
+    const chal = crypto.createHash("sha256").update(b.code_verifier || "").digest("base64url");
+    if (chal !== rec.code_challenge) return res.status(400).json({ error: "invalid_grant", error_description: "pkce" });
+    return issue();
+  }
+  if (b.grant_type === "refresh_token") {
+    const p = verify(b.refresh_token);
+    if (!p || p.t !== "refresh") return res.status(400).json({ error: "invalid_grant" });
+    return issue();
+  }
+  res.status(400).json({ error: "unsupported_grant_type" });
+});
+
+function requireBearer(req, res, next) {
+  const tok = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+  const p = verify(tok);
+  if (p && p.t === "access") return next();
+  res.status(401)
+    .set("WWW-Authenticate", `Bearer resource_metadata="${ORIGIN}/.well-known/oauth-protected-resource"`)
+    .json({ error: "unauthorized" });
+}
+
+async function handleMcp(req, res) {
   if (req.method !== "POST") return res.status(405).set("Allow", "POST").send("Method Not Allowed");
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   const server = buildServer();
   res.on("close", () => { transport.close(); server.close(); });
   await server.connect(transport);
   await transport.handleRequest(req, res, req.body);
+}
+
+// OAuth-protected endpoint (for Claude custom connectors)
+app.all("/mcp", requireBearer, handleMcp);
+
+// Legacy secret-in-path endpoint
+app.all("/mcp/:secret", (req, res) => {
+  if (req.params.secret !== MCP_SECRET) return res.status(401).send("unauthorized");
+  return handleMcp(req, res);
 });
 
 app.listen(PORT, () => console.log(`Whoop MCP listening on ${PORT}`));
