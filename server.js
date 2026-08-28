@@ -15,6 +15,9 @@ const {
   BASE_URL,
   RENDER_API_KEY,
   RENDER_SERVICE_ID,
+  STRAVA_CLIENT_ID,
+  STRAVA_CLIENT_SECRET,
+  STRAVA_REFRESH_TOKEN,
   PORT = 3000,
 } = process.env;
 
@@ -116,6 +119,67 @@ const rangeSchema = {
   end: z.string().optional().describe("ISO date/datetime (default now)"),
 };
 
+
+// ---------- Strava (carries Garmin workouts via Garmin Connect native auto-sync) ----------
+let stravaAccess = null, stravaExp = 0, stravaRefresh = STRAVA_REFRESH_TOKEN || null;
+
+async function persistEnv(key, value) {
+  if (!RENDER_API_KEY || !RENDER_SERVICE_ID) return;
+  try {
+    await fetch(`https://api.render.com/v1/services/${RENDER_SERVICE_ID}/env-vars/${key}`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${RENDER_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ value }),
+    });
+  } catch (e) { console.error("persist env failed", key, e.message); }
+}
+
+async function stravaToken(params) {
+  const res = await fetch("https://www.strava.com/oauth/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ client_id: STRAVA_CLIENT_ID, client_secret: STRAVA_CLIENT_SECRET, ...params }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(`Strava token ${res.status}: ${JSON.stringify(data)}`);
+  stravaAccess = data.access_token;
+  stravaExp = (data.expires_at - 60) * 1000;
+  if (data.refresh_token && data.refresh_token !== stravaRefresh) {
+    stravaRefresh = data.refresh_token;
+    await persistEnv("STRAVA_REFRESH_TOKEN", stravaRefresh);
+  }
+  return data;
+}
+
+async function strava(path, query = {}) {
+  if (!STRAVA_CLIENT_ID || !STRAVA_CLIENT_SECRET) throw new Error("Strava not configured");
+  if (!stravaAccess || Date.now() > stravaExp) {
+    if (!stravaRefresh) throw new Error("Strava not authorized. Visit /strava/auth once.");
+    await stravaToken({ grant_type: "refresh_token", refresh_token: stravaRefresh });
+  }
+  const url = new URL(`https://www.strava.com/api/v3${path}`);
+  for (const [k, v] of Object.entries(query)) if (v != null) url.searchParams.set(k, v);
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${stravaAccess}` } });
+  if (!res.ok) throw new Error(`Strava API ${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
+app.get("/strava/auth", (_req, res) => {
+  const u = new URL("https://www.strava.com/oauth/authorize");
+  u.searchParams.set("client_id", STRAVA_CLIENT_ID);
+  u.searchParams.set("redirect_uri", `${ORIGIN}/strava/callback`);
+  u.searchParams.set("response_type", "code");
+  u.searchParams.set("scope", "read,activity:read_all");
+  res.redirect(u.toString());
+});
+
+app.get("/strava/callback", async (req, res) => {
+  try {
+    await stravaToken({ grant_type: "authorization_code", code: req.query.code });
+    res.type("text").send("Strava connected. Token saved automatically. You can close this page.");
+  } catch (e) { res.status(500).send(String(e.message)); }
+});
+
 // ---------- MCP server ----------
 function buildServer() {
   const server = new McpServer({ name: "whoop", version: "1.0.0" });
@@ -199,6 +263,46 @@ function buildServer() {
         byDay[d] = { ...byDay[d], date: d, sleep_hours: +(asleepMs / 3600000).toFixed(2), sleep_performance: s.score?.sleep_performance_percentage, sleep_efficiency: s.score?.sleep_efficiency_percentage };
       }
       return ok(Object.values(byDay).sort((a, b) => a.date.localeCompare(b.date)));
+    }
+  );
+
+
+  server.tool(
+    "get_garmin_workouts",
+    "Garmin watch workouts (synced via Strava): name, sport, distance, moving time, pace/speed, avg/max HR, elevation, calories, suffer score. Args: days back (default 14).",
+    { days: z.number().int().min(1).max(180).optional() },
+    async ({ days = 14 }) => {
+      const after = Math.floor(Date.now() / 1000) - days * 86400;
+      const acts = await strava("/athlete/activities", { after, per_page: 100 });
+      return ok(acts.map((a) => ({
+        id: a.id, date: a.start_date_local, name: a.name, sport: a.sport_type,
+        distance_km: +(a.distance / 1000).toFixed(2),
+        moving_min: +(a.moving_time / 60).toFixed(1),
+        pace_min_per_km: a.distance > 100 ? +((a.moving_time / 60) / (a.distance / 1000)).toFixed(2) : null,
+        avg_hr: a.average_heartrate, max_hr: a.max_heartrate,
+        elev_gain_m: a.total_elevation_gain, calories: a.kilojoules,
+        suffer_score: a.suffer_score, device: a.device_name,
+      })));
+    }
+  );
+
+  server.tool(
+    "get_garmin_workout_detail",
+    "Detailed single workout by id (from get_garmin_workouts): splits, HR zones distribution, full stats.",
+    { id: z.number() },
+    async ({ id }) => {
+      const [act, zones] = await Promise.all([
+        strava(`/activities/${id}`),
+        strava(`/activities/${id}/zones`).catch(() => null),
+      ]);
+      return ok({
+        name: act.name, sport: act.sport_type, date: act.start_date_local,
+        distance_km: +(act.distance / 1000).toFixed(2), moving_min: +(act.moving_time / 60).toFixed(1),
+        avg_hr: act.average_heartrate, max_hr: act.max_heartrate, calories: act.calories,
+        elev_gain_m: act.total_elevation_gain, device: act.device_name,
+        splits_metric: (act.splits_metric || []).map((sp) => ({ km: sp.split, pace_min: +((sp.moving_time / 60)).toFixed(2), avg_hr: sp.average_heartrate, elev: sp.elevation_difference })),
+        hr_zones: zones?.find?.((z2) => z2.type === "heartrate")?.distribution_buckets || null,
+      });
     }
   );
 
