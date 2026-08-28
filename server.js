@@ -13,6 +13,8 @@ const {
   WHOOP_REFRESH_TOKEN,
   MCP_SECRET,
   BASE_URL,
+  RENDER_API_KEY,
+  RENDER_SERVICE_ID,
   PORT = 3000,
 } = process.env;
 
@@ -31,6 +33,19 @@ const REDIRECT_URI = `${BASE_URL.replace(/\/$/, "")}/callback`;
 let accessToken = null;
 let accessExpiresAt = 0;
 let refreshToken = WHOOP_REFRESH_TOKEN || null;
+let refreshing = null; // mutex so concurrent calls don't double-refresh (Whoop rotates refresh tokens)
+
+// Persist the rotated refresh token to Render env so it survives restarts/redeploys.
+async function persistRefreshToken(token) {
+  if (!RENDER_API_KEY || !RENDER_SERVICE_ID) return;
+  try {
+    await fetch(`https://api.render.com/v1/services/${RENDER_SERVICE_ID}/env-vars/WHOOP_REFRESH_TOKEN`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${RENDER_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ value: token }),
+    });
+  } catch (e) { console.error("persist token failed", e.message); }
+}
 
 async function tokenRequest(params) {
   const res = await fetch(TOKEN_URL, {
@@ -46,14 +61,21 @@ async function tokenRequest(params) {
   if (!res.ok) throw new Error(`Token error ${res.status}: ${JSON.stringify(data)}`);
   accessToken = data.access_token;
   accessExpiresAt = Date.now() + (data.expires_in - 60) * 1000;
-  if (data.refresh_token) refreshToken = data.refresh_token;
+  if (data.refresh_token && data.refresh_token !== refreshToken) {
+    refreshToken = data.refresh_token;
+    await persistRefreshToken(refreshToken);
+  }
   return data;
 }
 
 async function getAccessToken() {
   if (accessToken && Date.now() < accessExpiresAt) return accessToken;
   if (!refreshToken) throw new Error("Not authorized. Visit /auth to connect your Whoop account.");
-  await tokenRequest({ grant_type: "refresh_token", refresh_token: refreshToken, scope: "offline" });
+  if (!refreshing) {
+    refreshing = tokenRequest({ grant_type: "refresh_token", refresh_token: refreshToken, scope: "offline" })
+      .finally(() => { refreshing = null; });
+  }
+  await refreshing;
   return accessToken;
 }
 
@@ -215,10 +237,12 @@ app.get("/callback", async (req, res) => {
   pendingStates.delete(state);
   try {
     const data = await tokenRequest({ grant_type: "authorization_code", code, redirect_uri: REDIRECT_URI });
+    const saved = !!(RENDER_API_KEY && RENDER_SERVICE_ID);
     res.type("text").send(
       `Connected to Whoop.\n\n` +
-        `IMPORTANT: copy this refresh token into the WHOOP_REFRESH_TOKEN environment variable on Render and redeploy, ` +
-        `otherwise the connection is lost on the next restart:\n\n${data.refresh_token}\n`
+        (saved
+          ? `Token saved automatically. You can close this page.\n`
+          : `Copy this refresh token into WHOOP_REFRESH_TOKEN on Render and redeploy:\n\n${data.refresh_token}\n`)
     );
   } catch (e) {
     res.status(500).send(String(e.message));
