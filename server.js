@@ -225,8 +225,11 @@ app.get("/callback", async (req, res) => {
   }
 });
 
+app.get("/health", (_req, res) => res.json({ ok: true, authorized: !!refreshToken }));
+
 app.all("/mcp/:secret", async (req, res) => {
   if (req.params.secret !== MCP_SECRET) return res.status(401).send("unauthorized");
+  if (req.method !== "POST") return res.status(405).set("Allow", "POST").send("Method Not Allowed");
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   const server = buildServer();
   res.on("close", () => { transport.close(); server.close(); });
@@ -235,3 +238,8 @@ app.all("/mcp/:secret", async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Whoop MCP listening on ${PORT}`));
+
+// Keep the free instance from sleeping: ping our own public URL every 10 minutes.
+setInterval(() => {
+  fetch(`${BASE_URL.replace(/\/$/, "")}/health`).catch(() => {});
+}, 10 * 60 * 1000);
